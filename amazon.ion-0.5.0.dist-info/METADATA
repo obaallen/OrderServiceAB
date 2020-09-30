@@ -1,0 +1,14 @@
+Metadata-Version: 2.1
+Name: amazon.ion
+Version: 0.5.0
+Summary: A Python implementation of Amazon Ion.
+Home-page: http://github.com/amzn/ion-python
+Author: Amazon Ion Team
+Author-email: ion-team@amazon.com
+License: Apache License 2.0
+Platform: UNKNOWN
+Requires-Dist: six
+
+UNKNOWN
+
+

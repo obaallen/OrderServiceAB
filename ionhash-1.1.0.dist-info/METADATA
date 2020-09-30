@@ -1,0 +1,15 @@
+Metadata-Version: 2.1
+Name: ionhash
+Version: 1.1.0
+Summary: Python implementation of Amazon Ion Hash
+Home-page: http://github.com/amzn/ion-hash-python
+Author: Amazon Ion Team
+Author-email: ion-team@amazon.com
+License: Apache License 2.0
+Platform: UNKNOWN
+Requires-Dist: six
+Requires-Dist: amazon.ion (>=0.5)
+
+UNKNOWN
+
+
