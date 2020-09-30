@@ -239,9 +239,11 @@ def lambda_handler(event, context):
     orderstatus = validate_order(order["products"])
     if orderstatus:
         qldb_driver.execute_lambda(lambda x: update_order(x, order["orderId"], ready))
+        order["status"] = ready
     else:
         rollback_inventory(productQty)
         qldb_driver.execute_lambda(lambda x: update_order(x, order["orderId"], cancel))
+        order["status"] = cancel
         return {
             "success": False,
             "order": order,
