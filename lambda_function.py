@@ -214,7 +214,13 @@ def lambda_handler(event, context):
 
     # Cleanup products
     # order["products"] = cleanup_products(order["products"])
-    validate_inventory(order["products"])
+    validx = validate_inventory(order["products"])
+    if !validx:
+        return {
+            "success": False,
+            "order": order,
+            "message": "Order not completed. Not enough inventory."
+        }
 
     # Inject fields in the order
     order = inject_order_fields(order)
