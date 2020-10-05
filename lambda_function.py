@@ -3,8 +3,6 @@
 CreateOrderFunction
 """
 
-# import asyncio
-# import concurrent
 import datetime
 import json
 import os
@@ -13,7 +11,6 @@ from typing import List, Tuple
 from urllib.parse import urlparse
 import uuid
 import boto3
-# import jsonschema
 import requests
 ## QLDB
 import amazon.ion.simpleion as simpleion
@@ -21,14 +18,25 @@ from pyqldb.driver.qldb_driver import QldbDriver
 
 LEDGER = os.environ["LEDGER"]
 TABLE_NAME = os.environ["TABLE_NAME"]
+CART_TABLE = os.environ["CART_TABLE"]
 REGION = os.environ["REGION"]
 REGION2 = os.environ["REGION2"]
+APPSYNC_API_KEY = os.environ["APPSYNC_API_KEY"]
+APPSYNC_API_ENDPOINT_URL = os.environ["APPSYNC_API_ENDPOINT_URL"]
+
+headers = {
+    'Content-Type': "application/graphql",
+    'x-api-key': APPSYNC_API_KEY,
+    'cache-control': "no-cache",
+}
 
 # Instantiating the driver
 qldb_driver = QldbDriver(ledger_name=LEDGER)
-dynamodb = boto3.resource("dynamodb") # pylint: disable=invalid-name
-table = dynamodb.Table(TABLE_NAME) # pylint: disable=invalid-name,no-member
+dynamodb = boto3.resource("dynamodb") 
+table = dynamodb.Table(TABLE_NAME) 
+carttable = dynamodb.Table(CART_TABLE) 
 
+crossregion = False
 productQty = []
 
 def validate_inventory(products: List[dict]) -> List[dict]:
@@ -53,6 +61,7 @@ def validate_inventory(products: List[dict]) -> List[dict]:
             newqty = qty - product.get("quantity", 1)
 
         if qtyinregion[REGION] < product.get("quantity", 1):
+            crossregion = True
             newqtyinregion1 = 0
             newqtyinregion2 = qtyinregion[REGION2] - (product.get("quantity", 1) - qtyinregion[REGION])
             #store data for rollback
@@ -87,7 +96,6 @@ def validate_order(products: List[dict]) -> List[dict]:
     """
     Validate the inventory of the products in the order
     """
-
     for product in products:
         response = table.get_item(
             Key={
@@ -95,10 +103,30 @@ def validate_order(products: List[dict]) -> List[dict]:
             }
         )
         qtyinregion1 = response['Item']['QtyinRegion'][REGION]
-        qtyinregion2 = response['Item']['QtyinRegion'][REGION2]
-
-        if qtyinregion2 < 0 or qtyinregion1 < 0:
+        # Create an http graphql request.
+        query = "{getProduct(productid: %s) {QtyinRegion {%s}}}".format(product['productId'], REGION2)
+        appresponse = session.request(
+            url=APPSYNC_API_ENDPOINT_URL,
+            method='POST',
+            json={'query': query}
+        )
+        qtyinregion2 = appresponse["data"]["getProduct"]["QtyinRegion"][REGION2]
+        
+        if (qtyinregion1 + qtyinregion2) < product.get("quantity", 1):
             return (False, "Order cannot be accepted. Rolling back.")
+
+
+
+        # response = table.get_item(
+        #     Key={
+        #         'productid': product['productId']
+        #     }
+        # )
+        # qtyinregion1 = response['Item']['QtyinRegion'][REGION]
+        # qtyinregion2 = response['Item']['QtyinRegion'][REGION2]
+
+        # if qtyinregion2 < 0 or qtyinregion1 < 0:
+        #     return (False, "Order cannot be accepted. Rolling back.")
     return (True, "This order is good to go")
 
 
@@ -162,6 +190,15 @@ def update_inventory(products: List[dict]) -> List[dict]:
                 ':val3': product['qtyinregion2']
             }
         )
+        carttable.update_item(
+            Key={
+                'productid': product['productId']
+            },
+            UpdateExpression="SET Fulfilled = :val1",
+            ExpressionAttributeValues={
+                ':val1': True
+            }
+        )
     return (True, "Inventory updated")
 
 def rollback_inventory(products: List[dict]) -> List[dict]:
@@ -212,10 +249,9 @@ def lambda_handler(event, context):
     order = event["order"]
     order["userId"] = event["userId"]
 
-    # Cleanup products
-    # order["products"] = cleanup_products(order["products"])
+    # Cleanup & validate products
     validx = validate_inventory(order["products"])
-    if !validx:
+    if validx is False:
         return {
             "success": False,
             "order": order,
@@ -242,31 +278,23 @@ def lambda_handler(event, context):
     cancel = "CANCELLED"
 
     #confirm order
-    orderstatus = validate_order(order["products"])
-    if orderstatus:
+    if crossregion == False:
         qldb_driver.execute_lambda(lambda x: update_order(x, order["orderId"], ready))
         order["status"] = ready
     else:
-        rollback_inventory(productQty)
-        qldb_driver.execute_lambda(lambda x: update_order(x, order["orderId"], cancel))
-        order["status"] = cancel
-        return {
-            "success": False,
-            "order": order,
-            "message": "Order not completed. Please try again."
-        }
-
-    ## Log
-    # tracer.put_annotation("orderId", order["orderId"])
-    # logger.info({
-    #     "message": "Order {} created".format(order["orderId"]),
-    #     "orderId": order["orderId"]
-    # })
-    # logger.debug({
-    #     "message": "Order {} created".format(order["orderId"]),
-    #     "orderId": order["orderId"],
-    #     "order": order
-    # })
+        orderstatus = validate_order(order["products"])
+        if orderstatus:
+            qldb_driver.execute_lambda(lambda x: update_order(x, order["orderId"], ready))
+            order["status"] = ready
+        else:
+            rollback_inventory(productQty)
+            qldb_driver.execute_lambda(lambda x: update_order(x, order["orderId"], cancel))
+            order["status"] = cancel
+            return {
+                "success": False,
+                "order": order,
+                "message": "Order not completed. Please try again."
+            }
 
     return {
         "success": True,
