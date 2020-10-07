@@ -18,6 +18,7 @@ from pyqldb.driver.qldb_driver import QldbDriver
 
 LEDGER = os.environ["LEDGER"]
 TABLE_NAME = os.environ["TABLE_NAME"]
+REGIONALTABLE = os.environ["REGIONALTABLE"]
 CART_TABLE = os.environ["CART_TABLE"]
 REGION = os.environ["REGION"]
 REGION2 = os.environ["REGION2"]
@@ -35,9 +36,16 @@ qldb_driver = QldbDriver(ledger_name=LEDGER)
 dynamodb = boto3.resource("dynamodb") 
 table = dynamodb.Table(TABLE_NAME) 
 carttable = dynamodb.Table(CART_TABLE) 
+regionaltable = dynamodb.Table(REGIONALTABLE) 
 
-crossregion = False
 productQty = []
+
+def iscrossregion(products: List[dict]) -> List[dict]:
+    for product in products:
+        if product['leftoverqty'] > 0:
+            return(True)
+    return(False)
+
 
 def validate_inventory(products: List[dict]) -> List[dict]:
     """
@@ -61,9 +69,10 @@ def validate_inventory(products: List[dict]) -> List[dict]:
             newqty = qty - product.get("quantity", 1)
 
         if qtyinregion[REGION] < product.get("quantity", 1):
-            crossregion = True
+            crossregion = 1
             newqtyinregion1 = 0
-            newqtyinregion2 = qtyinregion[REGION2] - (product.get("quantity", 1) - qtyinregion[REGION])
+            leftoverqty = product.get("quantity", 1) - qtyinregion[REGION]
+            newqtyinregion2 = qtyinregion[REGION2] - leftoverqty
             #store data for rollback
             oldprodqty1 = qtyinregion[REGION]
             oldprodqty2 = product.get("quantity", 1) - qtyinregion[REGION]
@@ -73,6 +82,7 @@ def validate_inventory(products: List[dict]) -> List[dict]:
             #store data for rollback
             oldprodqty1 = product.get("quantity", 1)
             oldprodqty2 = 0
+            leftoverqty = 0
 
         productQty.append({
             "productId": product["productId"],
@@ -80,6 +90,7 @@ def validate_inventory(products: List[dict]) -> List[dict]:
             "price": price,
             "prodquantity": product.get("quantity", 1),
             "quantity": newqty,
+            "leftoverqty": leftoverqty,
             "oldqtyinregion1": oldprodqty1,
             "oldqtyinregion2": oldprodqty2,
             "qtyinregion1": newqtyinregion1,
@@ -92,41 +103,33 @@ def validate_inventory(products: List[dict]) -> List[dict]:
     return (True, "There are enough product inventory to place the order")
 
 
-def validate_order(products: List[dict]) -> List[dict]:
+def crossregion_order(products: List[dict]) -> List[dict]:
     """
-    Validate the inventory of the products in the order
+    Validate the inventory of the products in the order in the other region
     """
+    #session.request
     for product in products:
-        response = table.get_item(
-            Key={
-                'productid': product['productId']
-            }
-        )
-        qtyinregion1 = response['Item']['QtyinRegion'][REGION]
-        # Create an http graphql request.
-        query = "{getProduct(productid: %s) {QtyinRegion {%s}}}".format(product['productId'], REGION2)
-        appresponse = session.request(
-            url=APPSYNC_API_ENDPOINT_URL,
-            method='POST',
-            json={'query': query}
-        )
-        qtyinregion2 = appresponse["data"]["getProduct"]["QtyinRegion"][REGION2]
-        
-        if (qtyinregion1 + qtyinregion2) < product.get("quantity", 1):
-            return (False, "Order cannot be accepted. Rolling back.")
-
-
-
-        # response = table.get_item(
-        #     Key={
-        #         'productid': product['productId']
-        #     }
+        #mutation = "mutation { InventoryUpdate ( order: {products: {productId: '{}', quantity: '{}' } }, userId: 'val2') { success }}".format(product['productId'], product['leftoverqty'])
+        # mutation = """mutation {
+        #                 InventoryUpdate(order: {products: {productId: "df123", quantity: 0} }, userId: "val2") {
+        #                     success
+        #                 }
+        #                 }"""
+        # appresponse = request.post(
+        #     url=APPSYNC_API_ENDPOINT_URL,
+        #     headers=headers,
+        #     json={'query': mutation}#, "variables":{}}
         # )
-        # qtyinregion1 = response['Item']['QtyinRegion'][REGION]
-        # qtyinregion2 = response['Item']['QtyinRegion'][REGION2]
-
-        # if qtyinregion2 < 0 or qtyinregion1 < 0:
-        #     return (False, "Order cannot be accepted. Rolling back.")
+        valu1 = product['productId']
+        valu2 = product['leftoverqty']
+        print(valu1)
+        print(valu2)
+        payload = "{{\"query\":\"mutation {{\\n  InventoryUpdate(order: {{products: {{productId: \\\"{}\\\", quantity: {} }} }}, userId: \\\"val2\\\") {{\\n    success\\n  }}\\n}}\"}}".format(valu1, valu2)
+        url = APPSYNC_API_ENDPOINT_URL
+        appresponse = requests.request("POST", url, headers=headers, data = payload)
+        print(appresponse.text.encode('utf8'))
+        if appresponse.status_code != 200:
+            return (False, "Order cannot be accepted. Rolling back.")
     return (True, "This order is good to go")
 
 
@@ -174,6 +177,15 @@ def update_inventory(products: List[dict]) -> List[dict]:
     Update the inventory of the products in the order
     """
     for product in products:
+        regionaltable.update_item(
+            Key={
+                'productid': product['productId']
+            },
+            UpdateExpression="SET QtyinRegion = :val1",
+            ExpressionAttributeValues={
+                ':val1': product['qtyinregion1']
+            }
+        )
         table.update_item(
             Key={
                 'productid': product['productId']
@@ -258,43 +270,76 @@ def lambda_handler(event, context):
             "message": "Order not completed. Not enough inventory."
         }
 
+    crossregion = iscrossregion(productQty)
+
     # Inject fields in the order
     order = inject_order_fields(order)
-
+    
     # create the Ion doc
     ion_order = simpleion.loads(simpleion.dumps(order))
-
-    # Place order
-    try:
-        update_inventory(productQty)
-        qldb_driver.execute_lambda(lambda x: store_order(x, ion_order))
-    except:
-        return {
-            "success": False,
-            "message": "Issue placing order"
-        }
 
     ready = "READY FOR FULFILLMENT"
     cancel = "CANCELLED"
 
-    #confirm order
-    if crossregion == False:
-        qldb_driver.execute_lambda(lambda x: update_order(x, order["orderId"], ready))
+    # Place order
+    if crossregion is False:
+        print(crossregion)
         order["status"] = ready
+        ##### update authoritative regional db
+        update_inventory(productQty)
+        qldb_driver.execute_lambda(lambda x: store_order(x, ion_order))
     else:
-        orderstatus = validate_order(order["products"])
+        print("before trying")
+        try:
+            print("trying")
+            orderstatus = crossregion_order(productQty)
+        except OSError as inst:
+            return {
+                "success": False,
+                "message": "Issue Cross Region: {}".format(inst)
+            }
+        # except OSError as err:
+        #     print("OS error: {0}".format(err))
         if orderstatus:
-            qldb_driver.execute_lambda(lambda x: update_order(x, order["orderId"], ready))
+            update_inventory(productQty)
+            qldb_driver.execute_lambda(lambda x: store_order(x, ion_order))
             order["status"] = ready
         else:
             rollback_inventory(productQty)
-            qldb_driver.execute_lambda(lambda x: update_order(x, order["orderId"], cancel))
+            # qldb_driver.execute_lambda(lambda x: update_order(x, order["orderId"], cancel))
             order["status"] = cancel
             return {
                 "success": False,
                 "order": order,
                 "message": "Order not completed. Please try again."
             }
+        # try:
+        #     update_inventory(productQty)
+        #     qldb_driver.execute_lambda(lambda x: store_order(x, ion_order))
+        # except:
+        #     return {
+        #         "success": False,
+        #         "message": "Issue placing order"
+        #     }
+
+    #confirm order
+    # if crossregion == False:
+    #     qldb_driver.execute_lambda(lambda x: update_order(x, order["orderId"], ready))
+    #     order["status"] = ready
+    # else:
+    #     orderstatus = validate_order(order["products"])
+    #     if orderstatus:
+    #         qldb_driver.execute_lambda(lambda x: update_order(x, order["orderId"], ready))
+    #         order["status"] = ready
+    #     else:
+    #         rollback_inventory(productQty)
+    #         qldb_driver.execute_lambda(lambda x: update_order(x, order["orderId"], cancel))
+    #         order["status"] = cancel
+    #         return {
+    #             "success": False,
+    #             "order": order,
+    #             "message": "Order not completed. Please try again."
+    #         }
 
     return {
         "success": True,
